@@ -46,31 +46,37 @@ class FCNHead(nn.Sequential):
         super(FCNHead, self).__init__(*layers)
 
 class ReprModel(nn.Module):
-    """
-    Class defining end-to-end semantic segmentation model.
-    It combines AlexNet and FCN layers with interpolation for deconvolution.
-    This model is pretrained using cross-entropy loss.
-    After pre-training, use the get_repr() function to construct n_feat feature vectors for each pixel
-    """
-
-    def __init__(self, n_feat, n_classes):
+    def __init__(self, backbone, n_feat, n_classes):
         super(ReprModel, self).__init__()
         self.n_feat = n_feat
-        self.backbone = AlexNet()
-        self.classifier = FCNHead(256, n_feat)
+        self.backbone = backbone
+        self.classifier = FCNHead(2048, n_feat)
         self.linear = nn.Linear(n_feat, n_classes)
+
+        self.backbone.eval()
 
     def forward(self, x):
         repr = self.get_repr(x)
-        repr = repr.contiguous().view(-1, self.n_feat)
         out = self.linear(repr)
+
+        # Swap back to Batch x Width x Height x Features
+        # to be compatible with nn.CrossEntropyLoss
+        out = out.permute(0, 3, 1, 2)
         return out
 
     def get_repr(self, x):
         input_shape = x.shape[-2:]
-        features = self.backbone(x)
+
+        # Assume backbone is pre-trained and frozen
+        with torch.no_grad():
+            features = self.backbone(x)["out"]
+
+        # Train the classifier head only
         x = self.classifier(features)
-        x = F.interpolate(x, size=input_shape, mode='bilinear', align_corners=False)
+        x = F.interpolate(x, size=input_shape, mode="bilinear", align_corners=False)
+
+        # Batch x Width x Height x Features
         x = x.permute(0, 2, 3, 1)
+
         return x
 
