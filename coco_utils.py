@@ -1,19 +1,45 @@
 # From https://github.com/pytorch/vision/blob/master/references/segmentation/coco_utils.py
 
 import copy
+import os
+from typing import *
+
+from PIL import Image
 import torch
 import torch.utils.data
 import torchvision
-from PIL import Image
-
-import os
-
 from pycocotools import mask as coco_mask
 
 from transforms import Compose
 
+class CocoSuperpixel(torchvision.datasets.CocoDetection):
+    def __init__(
+        self,
+        root: str,
+        annFile: str,
+        transform: Optional[Callable] = None,
+        target_transform: Optional[Callable] = None,
+        transforms: Optional[Callable] = None,
+    ):
 
-class FilterAndRemapCocoCategories(object):
+        super().__init__(root, annFile, transform, target_transform, transforms)
+
+
+    def _load_superpixel(self, ann_id: int):
+        # TODO: Load super pixel information, using ann_id
+        return None
+
+    def __getitem__(self, index: int):
+        ann_id = self.ids[index]
+
+        image, target = super().__getitem__(index)
+
+        superpixels = self._load_superpixel(ann_id)
+
+        return image, superpixels
+
+
+class FilterAndRemapCocoCategories:
     def __init__(self, categories, remap=True):
         self.categories = categories
         self.remap = remap

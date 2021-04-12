@@ -2,6 +2,7 @@ import pickle
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -20,6 +21,21 @@ def get_transform(train):
     else:
         return presets.SegmentationPresetEval(base_size)
 
+def hinge_criterion(output, labels, margin=1, ignore_index=-1):
+    # output: B x C x W x H
+    # labels: B x W x H
+
+    mask = labels != ignore_index
+
+    # For pixels to ignore, temporarily use 0 as the label index
+    labels_index = torch.where(labels == ignore_index, 0, labels)
+    x_correct = torch.gather(output, dim=1, index=labels_index.unsqueeze(dim=1))
+
+    # Average across classes, loss: B x W x H
+    loss = torch.mean(F.relu(margin - (x_correct - output)), dim=1)
+
+    # Average over all batches and pixels, for masked regions only
+    return torch.sum(mask.float() * loss) / torch.sum(mask)
 
 def finetune_cnn(model, train_batches, num_epochs, device, lr=0.01):
     """
@@ -50,7 +66,8 @@ def finetune_cnn(model, train_batches, num_epochs, device, lr=0.01):
 
                 output = model(images)
 
-                loss = criterion(output, labels)
+                # loss = criterion(output, labels)
+                loss = hinge_criterion(output, labels, ignore_index=255)
                 total_loss += loss.item()
                 loss.backward()
                 optimizer.step()
@@ -106,7 +123,7 @@ if __name__ == "__main__":
 
     # Finetune the CNN to produce pixelwise feature vectors
     finetune_cnn(cnn_repr, train_batches, 1, device, lr=0.005)
-    torch.save(cnn_repr.state_dict(), "cnn_weights.pt")
+    torch.save(cnn_repr.state_dict(), "cnn_weights_hinge.pt")
 
     # Evaluate segmentation metrics on the validation set
     confmat = evaluate_cnn(cnn_repr, val_batches, NUM_CLASSES, device)
