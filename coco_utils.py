@@ -4,6 +4,14 @@ import copy
 import os
 from typing import *
 
+import skimage.io as io
+import skimage.segmentation as segmentation
+
+import numpy as np
+
+from tqdm import tqdm
+
+
 from PIL import Image
 import torch
 import torch.utils.data
@@ -11,6 +19,9 @@ import torchvision
 from pycocotools import mask as coco_mask
 
 from transforms import Compose
+
+from multiprocessing import Pool
+
 
 class CocoSuperpixel(torchvision.datasets.CocoDetection):
     def __init__(
@@ -20,23 +31,101 @@ class CocoSuperpixel(torchvision.datasets.CocoDetection):
         transform: Optional[Callable] = None,
         target_transform: Optional[Callable] = None,
         transforms: Optional[Callable] = None,
+        superpixel_dir=None,
     ):
 
         super().__init__(root, annFile, transform, target_transform, transforms)
-
-
-    def _load_superpixel(self, ann_id: int):
-        # TODO: Load super pixel information, using ann_id
-        return None
+        if superpixel_dir is None:
+            self._load_superpixel = self.generate_suprepixel_results
+        else:
+            self.superpixel_dir = superpixel_dir
+            self._load_superpixel = self.read_superpixel_file
 
     def __getitem__(self, index: int):
-        ann_id = self.ids[index]
-
         image, target = super().__getitem__(index)
 
-        superpixels = self._load_superpixel(ann_id)
+        superpixels = self._load_superpixel(index)
+        # TODO:convert superpixels to pytorch tensors
 
         return image, superpixels
+
+    @staticmethod
+    def find_superpixels_neighbors(sp):
+        # TODO:test function
+        sp_center = sp[:-1, :-1, np.newaxis]
+        sp_right = sp[:-1, 1:, np.newaxis]
+        sp_down = sp[1:, 1:, np.newaxis]
+        diff_x = np.concatenate(
+            [sp_center + sp_right, np.abs(sp_center - sp_right)], axis=2
+        )
+        diff_y = np.concatenate(
+            [sp_center + sp_down, np.abs(sp_center - sp_down)], axis=2
+        )
+        collection_diff = np.unique(
+            np.append(diff_x[diff_x[..., 1] > 0], diff_y[diff_y[..., 1] > 0], axis=0),
+            axis=0,
+        )
+        collection_edges = np.zeros(collection_diff.shape, dtype="uint16")
+        collection_edges[:, 0] = (collection_diff[:, 0] + collection_diff[:, 1]) / 2
+        collection_edges[:, 1] = (collection_diff[:, 0] - collection_diff[:, 1]) / 2
+        return collection_edges
+
+    def generate_suprepixel_results(self, index):
+        # TODO:test function
+        try:
+            img = super()._load_image(index)
+            if len(img.shape) == 2:
+                img = np.concatenate([img[..., np.newaxis]] * 3, axis=-1)
+            superpixels_labels = segmentation.slic(
+                img,
+                n_segments=200,
+                compactness=10.0,
+                max_iter=10,
+                sigma=0,
+                multichannel=True,
+                convert2lab=True,
+                enforce_connectivity=False,
+                min_size_factor=0.5,
+                max_size_factor=3,
+                start_label=0,
+            )
+
+            return superpixels_labels
+        except Exception as err:
+            print(err)
+            import pdb
+
+            pdb.set_trace()
+
+    def convert_dataset(self, parallel=True):
+        # TODO:test function
+        output_dir = self.superpixel_dir
+
+        def generate_sp_write_file(index):
+            superpixels_labels = self.generate_suprepixel_results(index)
+            collection_edges = self.find_superpixels_neighbors(superpixels_labels)
+            id = super().ids[index]
+            output_file = os.path.join(output_dir + f"{id}_sp")
+            try:
+                np.savez(
+                    output_file,
+                    superpixels=superpixels_labels.astype("uint16"),
+                    edges=collection_edges,
+                )
+            except:
+                return id
+
+        if parallel:
+            with Pool() as p:
+                temp = p.map(generate_sp_write_file, (i for i in range(len(super()))))
+                print(f"unsuccessful ids: {temp}")
+        else:
+            temp = []
+            for i in tqdm(range(len(super()))):
+                print(generate_sp_write_file(i))
+
+    def read_superpixel_file(self, index):
+        pass
 
 
 class FilterAndRemapCocoCategories:
@@ -118,25 +207,48 @@ def get_coco(root, image_set, transforms):
         "val": ("val2017", os.path.join("annotations", "instances_val2017.json")),
         # "train": ("val2017", os.path.join("annotations", "instances_val2017.json"))
     }
-    CAT_LIST = [0, 5, 2, 16, 9, 44, 6, 3, 17, 62, 21, 67, 18, 19, 4,
-                1, 64, 20, 63, 7, 72]
+    CAT_LIST = [
+        0,
+        5,
+        2,
+        16,
+        9,
+        44,
+        6,
+        3,
+        17,
+        62,
+        21,
+        67,
+        18,
+        19,
+        4,
+        1,
+        64,
+        20,
+        63,
+        7,
+        72,
+    ]
 
-    transforms = Compose([
-        FilterAndRemapCocoCategories(CAT_LIST, remap=True),
-        ConvertCocoPolysToMask(),
-        transforms
-    ])
+    transforms = Compose(
+        [
+            FilterAndRemapCocoCategories(CAT_LIST, remap=True),
+            ConvertCocoPolysToMask(),
+            transforms,
+        ]
+    )
 
     img_folder, ann_file = PATHS[image_set]
     img_folder = os.path.join(root, img_folder)
     ann_file = os.path.join(root, ann_file)
 
-    dataset = torchvision.datasets.CocoDetection(img_folder, ann_file, transforms=transforms)
+    dataset = torchvision.datasets.CocoDetection(
+        img_folder, ann_file, transforms=transforms
+    )
 
     if image_set == "train":
         dataset = _coco_remove_images_without_annotations(dataset, CAT_LIST)
 
     return dataset
 
-def generate_suprepixel_results(img_path, anno_id, output_path):
-    pass
