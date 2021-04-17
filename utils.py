@@ -1,4 +1,8 @@
 import torch
+import numpy as np
+import itertools
+
+from ortools.linear_solver import pywraplp
 
 
 class ConfusionMatrix(object):
@@ -78,4 +82,28 @@ def integer_linear_programming(node_potentials, edge_pair_indexes, edge_potentia
     
     Output: x:(num_nodes, num_classes), y:(num_edges, num_classes). The definitions of x and y are the same as HW3
     """
-    pass
+    num_nodes = node_potentials.shape[0]
+    num_edges = edge_potentials.shape[0]
+    num_classes = node_potentials.shape[1]
+
+    solver = pywraplp.Solver.CreateSolver('SCIP')
+
+    # set up vars for lp solver
+    node_vars = [[solver.IntVar(0, 1) for _ in range(num_classes)] for _ in range(num_nodes)]
+    edge_vars = [[solver.IntVar(0, 1) for _ in range(num_classes)] for _ in range(num_edges)]
+    # add constraints
+    for i, (idx1, idx2) in enumerate(edge_pair_indexes):
+        solver.Add(sum(node_vars[i]) == 1)
+        for c in range(num_classes):
+            solver.Add(edge_vars[i][c] <= node_vars[idx1][c])
+            solver.Add(edge_vars[i][c] <= node_vars[idx2][c])
+            solver.Add(edge_vars[i][c] >= node_vars[idx1][c] + node_vars[idx2][c] - 1)
+
+    # define objective
+    node_max = sum([node_potentials[i, c] * node_vars[i][c] for i, c in itertools.product(range(num_nodes), range(num_classes))])
+    edge_max = sum([edge_potentials[edge_pair_indexes[i]] * edge_vars[i][c] for i, c in itertools.product(range(num_edges), range(num_classes))])
+    solver.Maximize(node_max + edge_max)
+    solver.Solve()
+    x = np.array([[node_vars[c][i].solution_value() for c in range(num_classes)] for i in range(num_nodes)])
+    y = np.array([[edge_vars[c][i].solution_value() for c in range(num_classes)] for i in range(num_edges)])
+    return x, y
