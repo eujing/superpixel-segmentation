@@ -34,21 +34,29 @@ class CocoSuperpixel(torchvision.datasets.CocoDetection):
         transforms: Optional[Callable] = None,
         superpixel_dir=None,
     ):
-
+        '''
+        root is the dir of image data
+        annFile is the path of annotation json file (include the file name)
+        superpixel_dir is the dir of superpixel result, if it is None then will calculate superpixel when reading images
+        '''
         super().__init__(root, annFile, transform, target_transform, transforms)
-        if superpixel_dir is None:
-            self._load_superpixel = self.generate_suprepixel_results
-        else:
-            self.superpixel_dir = superpixel_dir
-            self._load_superpixel = self.read_superpixel_file
+        self.superpixel_dir = superpixel_dir
 
     def __getitem__(self, index: int):
-        image, target = super().__getitem__(index)
-
-        superpixels, collection_edges = self._load_superpixel(index)
+        '''
+        return img, target, superpixels, collection_edges
+        superpixels: (H, W), ndarray uint16 dtype, value is the label of superpixels clustering (not the label of segmentation).
+        collection_edges, (num_edges, 2), ndarray uint16 dtype, each pair is the label of neighboring superpixels.
+        '''
+        img, target = super().__getitem__(index)
+        if self.superpixel_dir is None:
+            superpixels, collection_edges = self.generate_suprepixel_results(
+                np.array(img)
+            )
+        else:
+            superpixels, collection_edges = self.read_superpixel_file(index)
         # TODO:convert superpixels to pytorch tensors?
-
-        return image, superpixels, collection_edges
+        return img, target, superpixels, collection_edges
 
     @staticmethod
     def find_superpixels_neighbors(sp):
@@ -70,12 +78,11 @@ class CocoSuperpixel(torchvision.datasets.CocoDetection):
         collection_edges[:, 1] = (collection_diff[:, 0] - collection_diff[:, 1]) / 2
         return collection_edges
 
-    def generate_suprepixel_results(self, index):
+    def generate_suprepixel_results(self, img):
         try:
-            img = super().__getitem__(index)[0]
-            img = np.array(img)
-            if len(img.shape) == 2:
-                img = np.concatenate([img[..., np.newaxis]] * 3, axis=-1)
+            # Convert (C, H, W) to (H, W, C)
+            if img.shape[-1] != 3:
+                img = np.moveaxis(img, 0, 2)
             superpixels_labels = segmentation.slic(
                 img,
                 n_segments=200,
@@ -90,19 +97,22 @@ class CocoSuperpixel(torchvision.datasets.CocoDetection):
                 start_label=0,
             )
             collection_edges = self.find_superpixels_neighbors(superpixels_labels)
-            return superpixels_labels, collection_edges
+            return superpixels_labels.astype("uint16"), collection_edges
         except Exception as err:
             print(err)
             breakpoint()
 
     def generate_sp_write_file(self, index):
-        superpixels_labels, collection_edges = self.generate_suprepixel_results(index)
+        img = super().__getitem__(index)[0]
+        superpixels_labels, collection_edges = self.generate_suprepixel_results(
+            np.array(img)
+        )
         id = self.ids[index]
         output_file = os.path.join(self.superpixel_dir, f"{id}_sp")
         try:
             np.savez(
                 output_file,
-                superpixels=superpixels_labels.astype("uint16"),
+                superpixels=superpixels_labels,
                 edges=collection_edges,
             )
         except:
@@ -111,6 +121,11 @@ class CocoSuperpixel(torchvision.datasets.CocoDetection):
     def convert_dataset(
         self, parallel=True, start_index=0, end_index=None, processes=None
     ):
+        '''
+        Convert the whole dataset and stored in self.superpixel_dir
+        '''
+        if self.superpixel_dir is None:
+            raise IOError("Please give superpixel_dir")
         if end_index is None:
             end_index = len(self)
         if parallel:
