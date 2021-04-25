@@ -89,11 +89,11 @@ def integer_linear_programming(node_potentials, edge_pair_indexes, edge_potentia
     solver = pywraplp.Solver.CreateSolver('SCIP')
 
     # set up vars for lp solver
-    node_vars = [[solver.IntVar(0, 1) for _ in range(num_classes)] for _ in range(num_nodes)]
-    edge_vars = [[solver.IntVar(0, 1) for _ in range(num_classes)] for _ in range(num_edges)]
+    node_vars = [[solver.IntVar(0, 1, f'n{i}_{j}') for i in range(num_classes)] for j in range(num_nodes)]
+    edge_vars = [[solver.IntVar(0, 1, f'n{i}_{j}') for i in range(num_classes)] for j in range(num_edges)]
     # add constraints
     for i, (idx1, idx2) in enumerate(edge_pair_indexes):
-        solver.Add(sum(node_vars[i]) == 1)
+        solver.Add(sum(edge_vars[i]) == 1)
         for c in range(num_classes):
             solver.Add(edge_vars[i][c] <= node_vars[idx1][c])
             solver.Add(edge_vars[i][c] <= node_vars[idx2][c])

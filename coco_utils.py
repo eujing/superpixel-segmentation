@@ -8,7 +8,6 @@ import skimage.io as io
 import skimage.segmentation as segmentation
 
 import numpy as np
-import pandas as pd
 
 from tqdm import tqdm
 
@@ -34,23 +33,23 @@ class CocoSuperpixel(torchvision.datasets.CocoDetection):
         transforms: Optional[Callable] = None,
         superpixel_dir=None,
     ):
-        '''
+        """
         root is the dir of image data
         annFile is the path of annotation json file (include the file name)
         superpixel_dir is the dir of superpixel result, if it is None then will calculate superpixel when reading images
-        '''
+        """
         super().__init__(root, annFile, transform, target_transform, transforms)
         self.superpixel_dir = superpixel_dir
 
     def __getitem__(self, index: int):
-        '''
+        """
         return img, target, superpixels, collection_edges
         superpixels: (H, W), ndarray uint16 dtype, value is the label of superpixels clustering (not the label of segmentation).
         collection_edges, (num_edges, 2), ndarray uint16 dtype, each pair is the label of neighboring superpixels.
-        '''
+        """
         img, target = super().__getitem__(index)
         if self.superpixel_dir is None:
-            superpixels, collection_edges = self.generate_suprepixel_results(
+            superpixels, collection_edges = CocoSuperpixel.generate_suprepixel_results(
                 np.array(img)
             )
         else:
@@ -78,74 +77,83 @@ class CocoSuperpixel(torchvision.datasets.CocoDetection):
         collection_edges[:, 1] = (collection_diff[:, 0] - collection_diff[:, 1]) / 2
         return collection_edges
 
-    def generate_suprepixel_results(self, img):
-        try:
-            # Convert (C, H, W) to (H, W, C)
-            if img.shape[-1] != 3:
-                img = np.moveaxis(img, 0, 2)
-            superpixels_labels = segmentation.slic(
-                img,
-                n_segments=200,
-                compactness=10.0,
-                max_iter=10,
-                sigma=0,
-                multichannel=True,
-                convert2lab=True,
-                enforce_connectivity=False,
-                min_size_factor=0.5,
-                max_size_factor=3,
-                start_label=0,
-            )
-            collection_edges = self.find_superpixels_neighbors(superpixels_labels)
-            return superpixels_labels.astype("uint16"), collection_edges
-        except Exception as err:
-            print(err)
-            breakpoint()
-
-    def generate_sp_write_file(self, index):
-        img = super().__getitem__(index)[0]
-        superpixels_labels, collection_edges = self.generate_suprepixel_results(
-            np.array(img)
+    @staticmethod
+    def generate_suprepixel_results(img):
+        # Convert (C, H, W) to (H, W, C)
+        if img.shape[-1] != 3:
+            img = np.moveaxis(img, 0, 2)
+        superpixels_labels = segmentation.slic(
+            img,
+            n_segments=200,
+            compactness=10.0,
+            max_iter=10,
+            sigma=0,
+            multichannel=True,
+            convert2lab=True,
+            enforce_connectivity=False,
+            min_size_factor=0.5,
+            max_size_factor=3,
+            start_label=0,
         )
-        id = self.ids[index]
-        output_file = os.path.join(self.superpixel_dir, f"{id}_sp")
+        collection_edges = CocoSuperpixel.find_superpixels_neighbors(superpixels_labels)
+        return superpixels_labels.astype("uint16"), collection_edges
+
+    @staticmethod
+    def generate_sp_write_file(args):
+        """
+        args=(img, id, superpixel_dir)
+        """
+        img, id, superpixel_dir = args
+        (
+            superpixels_labels,
+            collection_edges,
+        ) = CocoSuperpixel.generate_suprepixel_results(np.array(img))
+        output_file = os.path.join(superpixel_dir, f"{id}_sp")
         try:
             np.savez(
-                output_file,
-                superpixels=superpixels_labels,
-                edges=collection_edges,
+                output_file, superpixels=superpixels_labels, edges=collection_edges,
             )
         except:
-            return index
+            return id
 
     def convert_dataset(
         self, parallel=True, start_index=0, end_index=None, processes=None
     ):
-        '''
+        """
         Convert the whole dataset and stored in self.superpixel_dir
-        '''
+        """
         if self.superpixel_dir is None:
             raise IOError("Please give superpixel_dir")
         if end_index is None:
             end_index = len(self)
         if parallel:
             with Pool(processes=processes) as p:
-                # bad_index = list(
-                #     tqdm(
-                #         p.imap(self.generate_sp_write_file, range(len(self))),
-                #         total=len(self),
-                #     )
-                # )
-                bad_index = p.map(
-                    self.generate_sp_write_file,
-                    (i for i in range(start_index, end_index)),
+                bad_index = list(
+                    tqdm(
+                        p.imap(
+                            CocoSuperpixel.generate_sp_write_file,
+                            (
+                                (
+                                    super(CocoSuperpixel, self).__getitem__(i)[0],
+                                    self.ids[i],
+                                    self.superpixel_dir,
+                                )
+                                for i in range(start_index, end_index)
+                            ),
+                        ),
+                        total=(end_index - start_index),
+                    )
                 )
+                p.close()
+                p.join()
             bad_index = list(filter(lambda x: x is not None, bad_index))
             print(f"unsuccessful ids: {bad_index}")
         else:
             bad_index = []
-            for i in tqdm(range(len(self))):
-                temp = self.generate_sp_write_file(i)
+            for i in tqdm(range(start_index, end_index)):
+                temp = self.generate_sp_write_file(
+                    (super().__getitem__(i)[0], self.ids[i], self.superpixel_dir,)
+                )
                 if temp is not None:
                     bad_index.append(temp)
             print(f"unsuccessful ids: {bad_index}")
