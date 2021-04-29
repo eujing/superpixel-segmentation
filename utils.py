@@ -92,18 +92,23 @@ def integer_linear_programming(node_potentials, edge_pair_indexes, edge_potentia
     node_vars = [[solver.IntVar(0, 1, f'n{i}_{j}') for i in range(num_classes)] for j in range(num_nodes)]
     edge_vars = [[solver.IntVar(0, 1, f'n{i}_{j}') for i in range(num_classes)] for j in range(num_edges)]
     # add constraints
+    for i in range(num_nodes):
+        solver.Add(sum(node_vars[i]) == 1)
     for i, (idx1, idx2) in enumerate(edge_pair_indexes):
-        solver.Add(sum(edge_vars[i]) == 1)
         for c in range(num_classes):
             solver.Add(edge_vars[i][c] <= node_vars[idx1][c])
             solver.Add(edge_vars[i][c] <= node_vars[idx2][c])
             solver.Add(edge_vars[i][c] >= node_vars[idx1][c] + node_vars[idx2][c] - 1)
 
     # define objective
-    node_max = sum([node_potentials[i, c] * node_vars[i][c] for i, c in itertools.product(range(num_nodes), range(num_classes))])
-    edge_max = sum([edge_potentials[edge_pair_indexes[i]] * edge_vars[i][c] for i, c in itertools.product(range(num_edges), range(num_classes))])
-    solver.Maximize(node_max + edge_max)
+    objective = solver.Objective()
+    for i, c in itertools.product(range(num_nodes), range(num_classes)):
+        objective.SetCoefficient(node_vars[i][c], float(node_potentials[i, c]))
+    for i, c in itertools.product(range(num_edges), range(num_classes)):
+        objective.SetCoefficient(edge_vars[i][c], float(edge_potentials[i, c]))
+    objective.SetMaximization()
+    
     solver.Solve()
-    x = np.array([[node_vars[c][i].solution_value() for c in range(num_classes)] for i in range(num_nodes)])
-    y = np.array([[edge_vars[c][i].solution_value() for c in range(num_classes)] for i in range(num_edges)])
+    x = np.array([[node_vars[i][c].solution_value() for c in range(num_classes)] for i in range(num_nodes)])
+    y = np.array([[edge_vars[i][c].solution_value() for c in range(num_classes)] for i in range(num_edges)])
     return x, y

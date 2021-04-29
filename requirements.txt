@@ -3,3 +3,4 @@ torchvision==0.9.1
 tqdm==4.60.0
 scikit-image==0.18.1
 numpy==1.13.3
+ortools==8.2.8710
