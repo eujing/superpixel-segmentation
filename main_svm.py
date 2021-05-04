@@ -1,4 +1,3 @@
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -12,6 +11,7 @@ from models import ReprModel
 import presets
 
 import utils
+
 
 def get_transform(train):
     base_size = 520
@@ -102,6 +102,7 @@ def evaluate_cnn(model, test_batches, num_classes, device):
 
     return confmat
 
+
 class SvmModel(nn.Module):
     def __init__(self, backbone, n_feat, n_classes):
         super().__init__()
@@ -155,19 +156,34 @@ class SvmModel(nn.Module):
         edge_potentials = self.nn_edge(edge_features)
         return node_potentials, edge_potentials
 
-if __name__=='__main__':
+
+if __name__ == "__main__":
     NUM_FEATURES = 100
     NUM_CLASSES = 21
     device = torch.device("cpu")
+    superpixel_kwargs = {
+        "n_segments": 200,
+        "compactness": 50.0,
+        "max_iter": 5,
+        "sigma": 0,
+        "multichannel": True,
+        "convert2lab": True,
+        "enforce_connectivity": False,
+        "min_size_factor": 0.5,
+        "max_size_factor": 3,
+        "start_label": 0,
+    }
 
     train_dataset_sp = coco_utils.get_coco_superpixel(
-        image_dir="./data/train2017/", #TODO:change this to data directory which contains images
-        annFile_path="./data/annotations/instances_train2017.json", #TODO: change this to the path to json file of corresponding data
+        image_dir="./data/train2017/",  # TODO:change this to data directory which contains images
+        annFile_path="./data/annotations/instances_train2017.json",  # TODO: change this to the path to json file of corresponding data
         image_set="train",
         transforms=presets.SegmentationPresetEval(520),
         # superpixel_dir="./data/sp_train",
+        superpixel_kwargs=superpixel_kwargs,
+        normalization=((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
     )
-    #
+
     # # Convert the whole dataset and saved superpixel results in local
     # if isinstance(train_dataset_sp, torch.utils.data.Subset):
     #     train_dataset_sp.dataset.convert_dataset(
@@ -182,7 +198,7 @@ if __name__=='__main__':
 
     train_batches = DataLoader(
         train_dataset_sp,
-        batch_size=4,
+        batch_size=1,
         num_workers=2,
         # collate_fn=utils.collate_fn,
         shuffle=False,
@@ -203,7 +219,8 @@ if __name__=='__main__':
     node_potentials, edge_potentials = svm_model(img, sp, edges)
 
     x, y = utils.integer_linear_programming(
-        node_potentials.detach().to('cpu').numpy(), edges.detach().to('cpu').numpy(), edge_potentials.detach().to('cpu').numpy()
+        node_potentials.detach().to("cpu").numpy(),
+        edges.detach().to("cpu").numpy(),
+        edge_potentials.detach().to("cpu").numpy(),
     )
-
 

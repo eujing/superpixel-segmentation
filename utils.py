@@ -1,6 +1,10 @@
 import torch
 import numpy as np
 import itertools
+import matplotlib.pyplot as plt
+import matplotlib.colors as colors
+import os
+import hashlib
 
 from ortools.linear_solver import pywraplp
 
@@ -86,11 +90,17 @@ def integer_linear_programming(node_potentials, edge_pair_indexes, edge_potentia
     num_edges = edge_potentials.shape[0]
     num_classes = node_potentials.shape[1]
 
-    solver = pywraplp.Solver.CreateSolver('SCIP')
+    solver = pywraplp.Solver.CreateSolver("SCIP")
 
     # set up vars for lp solver
-    node_vars = [[solver.IntVar(0, 1, f'n{i}_{j}') for i in range(num_classes)] for j in range(num_nodes)]
-    edge_vars = [[solver.IntVar(0, 1, f'n{i}_{j}') for i in range(num_classes)] for j in range(num_edges)]
+    node_vars = [
+        [solver.IntVar(0, 1, f"n{i}_{j}") for i in range(num_classes)]
+        for j in range(num_nodes)
+    ]
+    edge_vars = [
+        [solver.IntVar(0, 1, f"n{i}_{j}") for i in range(num_classes)]
+        for j in range(num_edges)
+    ]
     # add constraints
     for i in range(num_nodes):
         solver.Add(sum(node_vars[i]) == 1)
@@ -107,8 +117,70 @@ def integer_linear_programming(node_potentials, edge_pair_indexes, edge_potentia
     for i, c in itertools.product(range(num_edges), range(num_classes)):
         objective.SetCoefficient(edge_vars[i][c], float(edge_potentials[i, c]))
     objective.SetMaximization()
-    
+
     solver.Solve()
-    x = np.array([[node_vars[i][c].solution_value() for c in range(num_classes)] for i in range(num_nodes)])
-    y = np.array([[edge_vars[i][c].solution_value() for c in range(num_classes)] for i in range(num_edges)])
+    x = np.array(
+        [
+            [node_vars[i][c].solution_value() for c in range(num_classes)]
+            for i in range(num_nodes)
+        ]
+    )
+    y = np.array(
+        [
+            [edge_vars[i][c].solution_value() for c in range(num_classes)]
+            for i in range(num_edges)
+        ]
+    )
     return x, y
+
+
+def plot_result(
+    img, label, predict, model, index, save_dir="./results", show_plot=False
+):
+    img = img.permute([1, 2, 0]).detach().to("cpu").numpy()
+    label = label.detach().to("cpu").numpy()
+    predict_label = (
+        torch.squeeze(predict).permute([1, 2, 0]).argmax(2).detach().to("cpu").numpy()
+    )
+
+    mean = np.array((0.485, 0.456, 0.406))
+    std = np.array((0.229, 0.224, 0.225))
+    img_denormaliz = (
+        img * std[np.newaxis, np.newaxis, :] + mean[np.newaxis, np.newaxis, :]
+    )
+    img_denormaliz = np.clip(img_denormaliz, a_min=0.0, a_max=1.0)
+
+    vmin = np.min([predict_label.min(), label.min().item()])
+    vmax = np.max([predict_label.max(), label.max().item()])
+    plt.imshow(img_denormaliz)
+    ax = plt.gca()
+    ax.axes.xaxis.set_visible(False)
+    ax.axes.yaxis.set_visible(False)
+
+    plt.savefig(os.path.join(save_dir, f"{model}_{index}_image.png"), dpi=300)
+    if show_plot:
+        plt.show()
+    plt.imshow(predict_label + 1, vmin=vmin + 1, vmax=vmax + 1, norm=colors.LogNorm())
+    ax = plt.gca()
+    ax.axes.xaxis.set_visible(False)
+    ax.axes.yaxis.set_visible(False)
+    plt.savefig(os.path.join(save_dir, f"{model}_{index}_predict.png"), dpi=300)
+
+    if show_plot:
+        plt.show()
+    ax = plt.gca()
+    ax.axes.xaxis.set_visible(False)
+    ax.axes.yaxis.set_visible(False)
+    plt.imshow(label + 1, vmin=vmin + 1, vmax=vmax + 1, norm=colors.LogNorm())
+    plt.savefig(os.path.join(save_dir, f"{model}_{index}_label.png"), dpi=300)
+    if show_plot:
+        plt.show()
+
+
+def encode_paras2name(prefix="", hash_length=40, hash_type="sha3_224", **kwargs):
+    sorted_keys = sorted(kwargs.keys())
+    name_str = "".join([f"{i}{kwargs[i]}" for i in sorted_keys])
+    f_hash = hashlib.new(hash_type)
+    f_hash.update(name_str.encode("utf-8"))
+    hash_code = f_hash.hexdigest()[-hash_length:]
+    return prefix + hash_code
