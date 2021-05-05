@@ -1,7 +1,4 @@
-import pickle
-
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
@@ -49,9 +46,6 @@ def finetune_cnn(model, train_batches, num_epochs, device, lr=0.01):
     # But make sure backbone stays in eval mode
     model.backbone.eval()
 
-    # TODO: Shall we do class weights?
-    # criterion = nn.CrossEntropyLoss(weight=torch.Tensor([1, 4]))
-    criterion = nn.CrossEntropyLoss(ignore_index=255)
     optimizer = optim.Adam(model.parameters(), lr=lr)
 
     for epoch in range(num_epochs):
@@ -112,9 +106,6 @@ if __name__ == "__main__":
 
     val_dataset = get_coco("./data", "val", get_transform(train=False))
     val_batches = DataLoader(val_dataset, batch_size=1, collate_fn=utils.collate_fn)
-
-    with open("catid_to_classid.pkl", "rb") as f:
-        catid_to_classid = pickle.load(f)
 
     # Load the pretrained FCN, mainly for its backbone
     cnn_pretrained = torch.hub.load('pytorch/vision:v0.9.0', 'fcn_resnet101', pretrained=True)

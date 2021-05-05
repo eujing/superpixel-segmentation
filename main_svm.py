@@ -1,39 +1,17 @@
+import random
+import pdb
+import traceback
+
+import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 import coco_utils
-from coco_utils import get_coco
-from models import ReprModel
+import models
 import presets
-
 import utils
-
-
-def get_transform(train):
-    base_size = 520
-    # crop_size = 480
-    return presets.SegmentationPresetEval(base_size)
-
-
-def hinge_criterion(output, labels, margin=1, ignore_index=-1):
-    # output: B x C x W x H
-    # labels: B x W x H
-
-    mask = labels != ignore_index
-
-    # For pixels to ignore, temporarily use 0 as the label index
-    labels_index = torch.where(labels == ignore_index, 0, labels)
-    x_correct = torch.gather(output, dim=1, index=labels_index.unsqueeze(dim=1))
-
-    # Average across classes, loss: B x W x H
-    loss = torch.mean(F.relu(margin - (x_correct - output)), dim=1)
-
-    # Average over all batches and pixels, for masked regions only
-    return torch.sum(mask.float() * loss) / torch.sum(mask)
 
 
 def finetune_cnn(model, train_batches, num_epochs, device, lr=0.01):
@@ -45,42 +23,57 @@ def finetune_cnn(model, train_batches, num_epochs, device, lr=0.01):
     # Set train mode since we have batch norm layers
     model.train()
 
-    # But make sure backbone stays in eval mode
-    model.backbone.eval()
+    structured = isinstance(model, models.StructSVMModel)
+    if structured:
+        criterion = utils.struct_hinge_criterion
+        desc = "Train S-SVM"
+    else:
+        criterion = utils.hinge_criterion
+        desc = "Train L-SVM"
 
-    # TODO: Shall we do class weights?
-    # criterion = nn.CrossEntropyLoss(weight=torch.Tensor([1, 4]))
-    criterion = nn.CrossEntropyLoss(ignore_index=255)
     optimizer = optim.Adam(model.parameters(), lr=lr)
 
     for epoch in range(num_epochs):
         total_loss = 0.0
 
-        for i, batch in enumerate(tqdm(train_batches)):
+        progress = tqdm(train_batches, dynamic_ncols=True, desc=desc)
+
+        for i, batch in enumerate(progress):
             try:
                 optimizer.zero_grad()
 
-                images, labels = batch
-                images, labels = images.to(device), labels.to(device)
+                images, pxl_labels, superpixels, edges = batch
+                images, pxl_labels = images.to(device), pxl_labels.to(device)
+                superpixels, edges = superpixels.to(device), edges.to(device)
 
-                output = model(images)
+                sp_labels = utils.pixel_labels_to_superpixel(pxl_labels, superpixels)
 
-                # loss = criterion(output, labels)
-                loss = hinge_criterion(output, labels, ignore_index=255)
+                if structured:
+                    node_potentials, edge_potentials = model(images, superpixels, edges)
+                    loss = criterion(
+                            model,
+                            node_potentials, edge_potentials,
+                            sp_labels, edges,
+                            ignore_index=255)
+
+                else:
+                    node_potentials = model(images, superpixels)
+                    loss = criterion(node_potentials, sp_labels, ignore_index=255)
+
+                assert not loss.isnan().any()
+
                 total_loss += loss.item()
                 loss.backward()
                 optimizer.step()
 
                 if (i + 1) % 100 == 0:
-                    print(
+                    progress.write(
                         f"[Epoch {epoch}, i={i}] Avg. Training loss: {total_loss / 100}"
                     )
                     total_loss = 0.0
 
-            except Exception as err:
-                print(err)
-                import pdb
-
+            except Exception:
+                traceback.print_exc()
                 pdb.set_trace()
 
 
@@ -90,77 +83,39 @@ def evaluate_cnn(model, test_batches, num_classes, device):
 
     model.eval()
 
+    structured = isinstance(model, models.StructSVMModel)
+    if structured:
+        desc = "Eval S-SVM"
+    else:
+        desc = "Eval L-SVM"
+
     with torch.no_grad():
-        for i, batch in enumerate(tqdm(test_batches)):
-            images, labels = batch
-            images, labels = images.to(device), labels.to(device)
+        progress = tqdm(test_batches, dynamic_ncols=True, desc=desc)
 
-            output = model(images)[0]
-            preds = output.argmax(0)
+        for i, batch in enumerate(progress):
+            images, pxl_labels, superpixels, edges = batch
+            images, pxl_labels = images.to(device), pxl_labels.to(device)
+            superpixels, edges = superpixels.to(device), edges.to(device)
 
-            confmat.update(labels.flatten(), preds.flatten())
+            if structured:
+                node_potentials, edge_potentials = model(images, superpixels, edges)
+                x_pred, _ = model.infer(node_potentials, edge_potentials, edges)
+                pred_sp_labels = x_pred.argmax(dim=1)
+
+            else:
+                node_potentials = model(images, superpixels)
+                pred_sp_labels = node_potentials.argmax(dim=1)
+
+            pred_pxl_labels = utils.superpixel_labels_to_pixel(pred_sp_labels, superpixels)
+
+            confmat.update(pxl_labels.flatten(), pred_pxl_labels.flatten())
 
     return confmat
-
-
-class SvmModel(nn.Module):
-    def __init__(self, backbone, n_feat, n_classes):
-        super().__init__()
-        self.backbone = backbone
-        self.n_feat_backbone = n_feat
-        self.n_feat = n_feat
-        self.n_classes = n_classes
-        self.nn_node = nn.Linear(n_feat, n_classes, bias=False)
-        self.nn_edge = nn.Linear(n_feat * 2, n_classes, bias=False)
-
-    def _node_feature_aggregation(self, features, superpixel):
-        """
-        features: torch.tensor(1, H, W, n_feat_backbone)
-        superpixel torch.LongTensor(H, W), value:superpixel label
-        return: node_features: torch.tensor(num_superpixels, n_feat)
-        """
-        sp_flat = superpixel.reshape(-1)
-        features_flat = features.reshape((-1, self.n_feat_backbone))
-        # Calculate mean feature for each superpixel cluster
-        num_sp = torch.max(sp_flat)
-        M = torch.zeros(num_sp + 1, len(features_flat)).to(features.device)
-        M[sp_flat, torch.arange(len(features_flat))] = 1
-        M = torch.nn.functional.normalize(M, p=1, dim=1)
-        node_features = torch.mm(M, features_flat)
-        return node_features
-
-    def _edge_feature_aggregation(self, node_features, edge_indexes):
-        """
-        node_features: torch.tensor(num_superpixels, n_feat)
-        edge_indexes: torch.LongTensor(num_edges, 2), value:node indexes of the edge
-        return: edge_features: torch.tensor(num_edges, 2*n_feat)
-        """
-        nodes_in_edges = node_features[edge_indexes, :]
-        edge_features = nodes_in_edges.reshape((-1, 2 * self.n_feat))
-        return edge_features
-
-    def forward(self, image, superpixel, edge_indexes):
-        """
-        image: torch.tensor(1, C, H, W)
-        superpixel torch.LongTensor(H, W), value:superpixel label
-        edge_indexes: torch.LongTensor(num_edges, 2), value:node indexes of the edge
-        return:
-        node_potentials: torch.tensor(num_nodes, n_classes)
-        edge_potentials: torch.tensor(num_edges, n_classes)
-        """
-        with torch.no_grad():
-            features = self.backbone(image)
-        node_features = self._node_feature_aggregation(features, superpixel)
-        edge_features = self._edge_feature_aggregation(node_features, edge_indexes)
-        node_potentials = self.nn_node(node_features)
-        edge_potentials = self.nn_edge(edge_features)
-        return node_potentials, edge_potentials
 
 
 if __name__ == "__main__":
     NUM_FEATURES = 100
     NUM_CLASSES = 21
-    device = torch.device("cpu")
     superpixel_kwargs = {
         "n_segments": 200,
         "compactness": 50.0,
@@ -173,6 +128,14 @@ if __name__ == "__main__":
         "max_size_factor": 3,
         "start_label": 0,
     }
+    device = torch.device("cuda")
+    SEED = 42
+    SUBSET_SIZE = 5000
+
+    # Set all random seeds
+    random.seed(SEED)
+    torch.manual_seed(SEED)
+    np.random.seed(SEED)
 
     train_dataset_sp = coco_utils.get_coco_superpixel(
         image_dir="./data/train2017/",  # TODO:change this to data directory which contains images
@@ -183,8 +146,17 @@ if __name__ == "__main__":
         superpixel_kwargs=superpixel_kwargs,
         normalization=((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
     )
+    val_dataset_sp = coco_utils.get_coco_superpixel(
+        image_dir="./data/val2017/", # TODO:change this to data directory which contains images
+        annFile_path="./data/annotations/instances_val2017.json", # TODO: change this to the path to json file of corresponding data
+        image_set="val",
+        transforms=presets.SegmentationPresetEval(520),
+        # superpixel_dir="./data/sp_val",
+        superpixel_kwargs=superpixel_kwargs,
+        normalization=((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+    )
 
-    # # Convert the whole dataset and saved superpixel results in local
+    # Convert the whole dataset and saved superpixel results in local
     # if isinstance(train_dataset_sp, torch.utils.data.Subset):
     #     train_dataset_sp.dataset.convert_dataset(
     #         parallel=True, processes=4,
@@ -196,31 +168,41 @@ if __name__ == "__main__":
     #         # start_index=0, end_index=None
     #     )
 
+    train_indices = torch.randperm(len(train_dataset_sp))[:SUBSET_SIZE]
     train_batches = DataLoader(
         train_dataset_sp,
         batch_size=1,
-        num_workers=2,
+        num_workers=1,
         # collate_fn=utils.collate_fn,
-        shuffle=False,
+        sampler=torch.utils.data.SubsetRandomSampler(train_indices)
     )
+    val_indices = torch.randperm(len(val_dataset_sp))
+    val_batches = DataLoader(
+        val_dataset_sp,
+        batch_size=1,
+        num_workers=1,
+        # collate_fn=utils.collate_fn,
+        sampler=torch.utils.data.SubsetRandomSampler(val_indices)
+    )
+
     cnn_pretrained = torch.hub.load(
         "pytorch/vision:v0.9.0", "fcn_resnet101", pretrained=True
     )
     # Load up a new FCN head on top of the backbone to learn feature vectors instead
     cnn_repr = (
-        ReprModel(cnn_pretrained.backbone, NUM_FEATURES, NUM_CLASSES).to(device).eval()
-    )
-    svm_model = SvmModel(cnn_repr.get_repr, NUM_FEATURES, NUM_CLASSES).to(device)
-
-    img, labels, sp, edges = train_dataset_sp[0]
-    img = torch.unsqueeze(img, 0)
-    sp = torch.LongTensor(sp.astype(int))
-    edges = torch.LongTensor(edges.astype(int))
-    node_potentials, edge_potentials = svm_model(img, sp, edges)
-
-    x, y = utils.integer_linear_programming(
-        node_potentials.detach().to("cpu").numpy(),
-        edges.detach().to("cpu").numpy(),
-        edge_potentials.detach().to("cpu").numpy(),
+        models.ReprModel(cnn_pretrained.backbone, NUM_FEATURES, NUM_CLASSES).to(device).eval()
     )
 
+    # Select model to train
+    svm_model = models.BaselineSVMModel(cnn_repr.get_repr, NUM_FEATURES, NUM_CLASSES).to(device)
+    # svm_model = models.StructSVMModel(cnn_repr.get_repr, NUM_FEATURES, NUM_CLASSES).to(device)
+
+    # Finetune the SVM to produce superpixel-wise feature vectors
+    finetune_cnn(svm_model, train_batches, 1, device, lr=0.005)
+
+    torch.save(svm_model.state_dict(), "lsvm_sp_weights.pt")
+    # torch.save(svm_model.state_dict(), "ssvm_sp_weights.pt")
+
+    # Evaluate pixel-wise segmentation metrics on the validation set
+    conf_mat = evaluate_cnn(svm_model, val_batches, NUM_CLASSES, device)
+    print(conf_mat)

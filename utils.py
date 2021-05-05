@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 import numpy as np
 import itertools
 import matplotlib.pyplot as plt
@@ -8,6 +9,8 @@ import hashlib
 
 from ortools.linear_solver import pywraplp
 
+solver = pywraplp.Solver.CreateSolver("SCIP")
+# solver = pywraplp.Solver("MAPSolver", pywraplp.Solver.GUROBI_MIXED_INTEGER_PROGRAMMING)
 
 class ConfusionMatrix(object):
     def __init__(self, num_classes):
@@ -72,7 +75,72 @@ def collate_fn(batch):
     return batched_imgs, batched_targets
 
 
-def integer_linear_programming(node_potentials, edge_pair_indexes, edge_potentials):
+def hinge_criterion(output, labels, margin=1, ignore_index=255):
+    # output: ... x n_classes
+    # labels: ...
+
+    mask = labels != ignore_index
+
+    # For pixels to ignore, temporarily use 0 as the label index
+    labels_index = torch.where(labels == ignore_index, 0, labels)
+    # x_correct: ... x 1
+    x_correct = torch.gather(output, dim=-1, index=labels_index.unsqueeze(dim=-1))
+
+    # Average across classes
+    loss = torch.mean(F.relu(margin - (x_correct - output)), dim=-1)
+
+    # Average over all other dimensions ..., for masked regions only
+    return torch.sum(mask.float() * loss) / torch.sum(mask)
+
+
+def struct_hinge_criterion(
+        model,
+        node_potentials, edge_potentials,
+        sp_labels, edge_indices,
+        ignore_index=255):
+    """
+    Args:
+        model: models.StructSVMModel
+        node_potentials: torch.tensor(num_nodes, n_classes)
+        edge_potentials: torch.tensor(num_edges, n_classes)
+        sp_labels: torch.LongTensor(num_nodes), values are class labels
+        edge_indices: torch.LongTensor(1, num_edges, 2), values are node indices
+    """
+
+    _, n_classes = node_potentials.shape
+
+    mask = sp_labels != ignore_index
+    # For superpixels to ignore, temporarily use 0 as the class index
+    sp_labels_index = torch.where(sp_labels == ignore_index, 0, sp_labels)
+
+    # True assignments
+    x_true = F.one_hot(sp_labels_index, num_classes=n_classes)
+    x_true_pairs = x_true[edge_indices.squeeze(dim=0)]
+    y_true = x_true_pairs[:, 0, :] * x_true_pairs[:, 1, :]
+
+    # MAP assignments
+    x_pred, y_pred = model.infer(node_potentials, edge_potentials, edge_indices, x_true=x_true)
+
+    # Margin is normalized hamming loss over valid superpixels only
+    norm_hamming_loss = (x_pred[mask] != x_true[mask]).float().mean()
+
+    # Scoring function over valid nodes and edges only
+    mask_x = mask.float().unsqueeze(dim=1)
+    mask_x_pairs = mask_x[edge_indices.squeeze(dim=0)]
+    mask_y = mask_x_pairs[:, 0, :] * mask_x_pairs[:, 1, :]
+    def score(x, y):
+        return torch.sum(mask_x * node_potentials * x) + torch.sum(mask_y * edge_potentials * y)
+
+    hinge_loss = F.relu(norm_hamming_loss - (score(x_true, y_true) - score(x_pred, y_pred)))
+
+    return hinge_loss
+
+
+def integer_linear_programming(
+        node_potentials,
+        edge_pair_indexes,
+        edge_potentials,
+        x_true=None):
     """
     All the potentails are acutally log-potentials
     node_potentials.shape=(num_nodes, num_classes)
@@ -90,15 +158,15 @@ def integer_linear_programming(node_potentials, edge_pair_indexes, edge_potentia
     num_edges = edge_potentials.shape[0]
     num_classes = node_potentials.shape[1]
 
-    solver = pywraplp.Solver.CreateSolver("SCIP")
+    solver.Clear()
 
     # set up vars for lp solver
     node_vars = [
-        [solver.IntVar(0, 1, f"n{i}_{j}") for i in range(num_classes)]
+        [solver.BoolVar(f"x{i}_{j}") for i in range(num_classes)]
         for j in range(num_nodes)
     ]
     edge_vars = [
-        [solver.IntVar(0, 1, f"n{i}_{j}") for i in range(num_classes)]
+        [solver.BoolVar(f"y{i}_{j}") for i in range(num_classes)]
         for j in range(num_edges)
     ]
     # add constraints
@@ -113,7 +181,11 @@ def integer_linear_programming(node_potentials, edge_pair_indexes, edge_potentia
     # define objective
     objective = solver.Objective()
     for i, c in itertools.product(range(num_nodes), range(num_classes)):
-        objective.SetCoefficient(node_vars[i][c], float(node_potentials[i, c]))
+        coeff = float(node_potentials[i, c])
+        # For Loss Augmented Inference
+        if x_true is not None:
+            coeff += (1 - 2*float(x_true[i, c])) / (num_nodes * num_classes)
+        objective.SetCoefficient(node_vars[i][c], coeff)
     for i, c in itertools.product(range(num_edges), range(num_classes)):
         objective.SetCoefficient(edge_vars[i][c], float(edge_potentials[i, c]))
     objective.SetMaximization()
@@ -184,3 +256,38 @@ def encode_paras2name(prefix="", hash_length=40, hash_type="sha3_224", **kwargs)
     f_hash.update(name_str.encode("utf-8"))
     hash_code = f_hash.hexdigest()[-hash_length:]
     return prefix + hash_code
+
+
+def pixel_labels_to_superpixel(pxl_labels, superpixels):
+    """
+    pxl_labels: torch.LongTensor(W, H), values are class labels
+    superpixels: torch.LongTensor(W, H), values are superpixel assignments
+
+    returns: 
+        sp_labels: torch.LongTensor(num_nodes), values are class labels
+    """
+    num_superpixels = superpixels.max() + 1
+    sp_labels = torch.zeros(
+            num_superpixels,
+            dtype=torch.long,
+            device=pxl_labels.device)
+
+    # Majority vote
+    for i in range(num_superpixels):
+        label_counts = pxl_labels[superpixels == i].bincount()
+
+        if len(label_counts) > 0:
+            sp_labels[i] = label_counts.argmax()
+
+    return sp_labels
+
+def superpixel_labels_to_pixel(sp_labels, superpixels):
+    """
+    sp_labels: torch.LongTensor(num_nodes), values are class labels
+    superpixels: torch.LongTensor(W, H), values are superpixel assignments
+
+    returns:
+        pxl_labels: torch.LongTensor(W, H), values are class labels
+    """
+
+    return sp_labels[superpixels]

@@ -94,7 +94,11 @@ class CocoSuperpixel(torchvision.datasets.CocoDetection):
             )
         else:
             superpixels, collection_edges = self.read_superpixel_file(index)
+
         # TODO:convert superpixels to pytorch tensors?
+        superpixels = torch.LongTensor(superpixels.astype(int))
+        collection_edges = torch.LongTensor(collection_edges.astype(int))
+
         return img, target, superpixels, collection_edges
 
     def denormalize_image(self, img):
